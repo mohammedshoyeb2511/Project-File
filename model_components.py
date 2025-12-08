@@ -1,15 +1,13 @@
-import math
-import os
 import random
 from collections import defaultdict
-from typing import Dict, List, Tuple, Set
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-#              GAP-1: Dynamic-capacity Embedder
+# ============================================================
+#              GAP-1: Dynamic-capacity Embedder (SAFE)
+# ============================================================
 class DynamicEmbedder(nn.Module):
     def __init__(self, num_nodes, high_nodes, low_nodes,
                  emb_dim_high, emb_dim_low, emb_dim_common):
@@ -41,78 +39,84 @@ class DynamicEmbedder(nn.Module):
 
     def forward(self, node_ids):
         DEVICE = node_ids.device
-        node_list = node_ids.tolist()
-        out = torch.zeros(len(node_list), self.emb_dim_common, device=DEVICE)
+        node_ids_cpu = node_ids.cpu()
 
-        high_loc, high_lut, low_loc, low_lut = [], [], [], []
+        out = torch.zeros(node_ids.size(0), self.emb_dim_common, device=DEVICE)
 
-        for pos, gid in enumerate(node_list):
-            if gid in self.id_map_high:
-                high_loc.append(pos)
-                high_lut.append(self.id_map_high[gid])
-            else:
-                low_loc.append(pos)
-                low_lut.append(self.id_map_low.get(gid, 0))
+        high_mask = torch.isin(node_ids_cpu, self.high_nodes.cpu())
+        low_mask = ~high_mask
 
-        if high_loc:
-            h = torch.tensor(high_lut, device=DEVICE)
-            p = torch.tensor(high_loc, device=DEVICE)
-            out[p] = self.proj_high(self.emb_high(h))
+        if high_mask.any():
+            high_nodes = node_ids_cpu[high_mask]
+            high_idx = torch.tensor(
+                [self.id_map_high[int(i)] for i in high_nodes],
+                device=DEVICE
+            )
+            out[high_mask] = self.proj_high(self.emb_high(high_idx))
 
-        if low_loc:
-            l = torch.tensor(low_lut, device=DEVICE)
-            p = torch.tensor(low_loc, device=DEVICE)
-            out[p] = self.proj_low(self.emb_low(l))
+        if low_mask.any():
+            low_nodes = node_ids_cpu[low_mask]
+            low_idx = torch.tensor(
+                [self.id_map_low.get(int(i), 0) for i in low_nodes],
+                device=DEVICE
+            )
+            out[low_mask] = self.proj_low(self.emb_low(low_idx))
 
         return out
 
 
-#                    Pure PyTorch R-GCN Layer
+# ============================================================
+#                    SAFE R-GCN Layer (OOM-FREE)
+# ============================================================
 class RGCNLayer(nn.Module):
-    def __init__(self, in_dim, out_dim, num_relations, use_bias=True):
+    def __init__(self, in_dim, out_dim, num_relations):
         super().__init__()
         self.num_relations = num_relations
         self.W_r = nn.Parameter(torch.empty(num_relations, in_dim, out_dim))
-        self.W_0 = nn.Linear(in_dim, out_dim, bias=use_bias)
+        self.W_0 = nn.Linear(in_dim, out_dim)
         self.reset_parameters()
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.W_r)
         nn.init.xavier_uniform_(self.W_0.weight)
-        if self.W_0.bias is not None:
-            nn.init.zeros_(self.W_0.bias)
+        nn.init.zeros_(self.W_0.bias)
 
+    # ✅ Memory-safe relation-wise message passing
     def forward(self, x, edge_index, edge_type, num_nodes_local):
         DEVICE = x.device
-        N = num_nodes_local
-        out = torch.zeros(N, self.W_0.out_features, device=DEVICE)
-
-        dst = edge_index[1]
         src = edge_index[0]
+        dst = edge_index[1]
 
-        deg_r = torch.zeros(self.num_relations, N, device=DEVICE, dtype=torch.long)
-        deg_r.index_add_(1, dst, F.one_hot(edge_type, self.num_relations).T.long())
+        out = torch.zeros(num_nodes_local, self.W_0.out_features, device=DEVICE)
+
+        deg = torch.zeros(num_nodes_local, device=DEVICE)
+        deg.index_add_(0, dst, torch.ones_like(dst, dtype=torch.float))
 
         for r in range(self.num_relations):
             mask = (edge_type == r)
             if mask.sum() == 0:
                 continue
+
             s = src[mask]
             d = dst[mask]
+
             msg = x[s] @ self.W_r[r]
-            msg = msg / deg_r[r, d].clamp_min(1).unsqueeze(1)
+            msg = msg / deg[d].clamp_min(1).unsqueeze(1)
             out.index_add_(0, d, msg)
 
         return out + self.W_0(x)
 
 
+# ============================================================
 #                    Full R-GCN (GAP-1 + GAP-2)
+# ============================================================
 class PureRGCN(nn.Module):
     def __init__(self, num_nodes, num_relations,
                  high_nodes, low_nodes,
                  emb_dim_high, emb_dim_low, emb_dim_common,
                  hidden_dim, num_layers, dropout):
         super().__init__()
+
         self.embedder = DynamicEmbedder(
             num_nodes, high_nodes, low_nodes,
             emb_dim_high, emb_dim_low, emb_dim_common
@@ -120,6 +124,7 @@ class PureRGCN(nn.Module):
 
         self.layers = nn.ModuleList()
         in_dim = emb_dim_common
+
         for i in range(num_layers):
             out = hidden_dim if i < num_layers - 1 else emb_dim_common
             self.layers.append(RGCNLayer(in_dim, out, num_relations))
@@ -128,25 +133,42 @@ class PureRGCN(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.rel_embed = nn.Embedding(num_relations, emb_dim_common)
 
+    # ✅ ✅ ✅ THIS IS THE ONLY CORRECT FORWARD
     def forward(self, local_nodes, edge_index_local, edge_type_local):
         x = self.embedder(local_nodes)
+
         for i, layer in enumerate(self.layers):
-            x = layer(x, edge_index_local, edge_type_local, local_nodes.numel())
+            x = layer(
+                x,
+                edge_index_local,
+                edge_type_local,
+                local_nodes.numel()   # ✅ required argument
+            )
+
             if i < len(self.layers) - 1:
                 x = F.relu(x)
                 x = self.dropout(x)
+
         return x
 
     def score(self, h_global, r, t_global, local_nodes, local_emb):
         DEVICE = local_nodes.device
         lut = {int(g): i for i, g in enumerate(local_nodes.tolist())}
-        h = local_emb[torch.tensor([lut[int(i)] for i in h_global.tolist()], device=DEVICE)]
-        t = local_emb[torch.tensor([lut[int(i)] for i in t_global.tolist()], device=DEVICE)]
+
+        h = local_emb[
+            torch.tensor([lut[int(i)] for i in h_global.tolist()], device=DEVICE)
+        ]
+        t = local_emb[
+            torch.tensor([lut[int(i)] for i in t_global.tolist()], device=DEVICE)
+        ]
+
         rvec = self.rel_embed(r)
         return torch.sum(h * rvec * t, dim=-1)
 
 
+# ============================================================
 #                      Degree Split (GAP-1)
+# ============================================================
 def compute_degree(num_nodes, edge_index):
     deg = torch.zeros(num_nodes, dtype=torch.long)
     deg.index_add_(0, edge_index[0].cpu(), torch.ones(edge_index.size(1), dtype=torch.long))
@@ -161,37 +183,49 @@ def degree_split(num_nodes, edge_index, pct):
     return high, low
 
 
+# ============================================================
 #                Adjacency for Neighbor Sampling (GAP-2)
+# ============================================================
 def build_adj(num_nodes, edge_index, edge_type, num_relations):
     edge_index = edge_index.cpu()
     edge_type  = edge_type.cpu()
 
     out_neighbors = [defaultdict(list) for _ in range(num_relations)]
 
-    for s, d, r in zip(edge_index[0].tolist(), edge_index[1].tolist(), edge_type.tolist()):
+    for s, d, r in zip(
+        edge_index[0].tolist(),
+        edge_index[1].tolist(),
+        edge_type.tolist()
+    ):
         out_neighbors[r][s].append(d)
 
     return out_neighbors
 
 
-# Pure Python Neighbor Sampler
+# ============================================================
+#                 Pure Python Neighbor Sampler (SAFE)
+# ============================================================
 def sample_subgraph(seeds, num_layers, num_neighbors,
                     out_neighbors, num_relations, max_edges):
+
     frontier = set(int(s) for s in seeds.tolist())
     nodes = set(frontier)
 
     for _ in range(num_layers):
         new_frontier = set()
         for u in list(frontier):
-            for r in range(num_relations):
-                nbrs = out_neighbors[r].get(u, [])
+
+            for nbr_map in out_neighbors:
+                nbrs = nbr_map.get(u, [])
                 if not nbrs:
                     continue
+
                 chosen = nbrs if len(nbrs) <= num_neighbors else random.sample(nbrs, num_neighbors)
                 for v in chosen:
                     if v not in nodes:
                         nodes.add(v)
                         new_frontier.add(v)
+
         frontier = new_frontier
         if len(nodes) * num_neighbors * num_layers > 2 * max_edges:
             break
@@ -201,10 +235,13 @@ def sample_subgraph(seeds, num_layers, num_neighbors,
 
     ls, ld, lr = [], [], []
     edge_count = 0
-    for u in local_nodes:
-        u_local = lut[u]
-        for r in range(num_relations):
-            for v in out_neighbors[r].get(u, []):
+
+    for r, nbr_map in enumerate(out_neighbors):
+        for u in local_nodes:
+            if u not in nbr_map:
+                continue
+            u_local = lut[u]
+            for v in nbr_map[u]:
                 if v in nodes:
                     ls.append(u_local)
                     ld.append(lut[v])
@@ -214,14 +251,25 @@ def sample_subgraph(seeds, num_layers, num_neighbors,
                         break
 
     DEVICE = seeds.device
-    edge_index_local = torch.tensor([ls, ld], dtype=torch.long, device=DEVICE) if ls else torch.empty(2,0,dtype=torch.long,device=DEVICE)
-    edge_type_local  = torch.tensor(lr, dtype=torch.long, device=DEVICE) if lr else torch.empty(0,dtype=torch.long,device=DEVICE)
+
+    edge_index_local = (
+        torch.tensor([ls, ld], dtype=torch.long, device=DEVICE)
+        if ls else torch.empty(2,0,dtype=torch.long,device=DEVICE)
+    )
+
+    edge_type_local  = (
+        torch.tensor(lr, dtype=torch.long, device=DEVICE)
+        if lr else torch.empty(0,dtype=torch.long,device=DEVICE)
+    )
+
     local_nodes = torch.tensor(local_nodes, dtype=torch.long, device=DEVICE)
 
     return local_nodes, edge_index_local, edge_type_local
 
 
-# Negative Sampling (training utility)
+# ============================================================
+#         Negative Sampling (training utility)
+# ============================================================
 def sample_pos_neg(edge_index, edge_type, idx, num_nodes, negative_ratio):
     pos_edges = edge_index[:, idx]
     pos_r = edge_type[idx]
