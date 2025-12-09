@@ -1,6 +1,6 @@
 # SNOMED CT + MIMIC-IV Graph Construction and R-GCN Model Training
 
-This repository provides the full pipeline for constructing a unified clinical knowledge graph from **SNOMED CT** and **MIMIC-IV**, generating the required `graph.pt` file, and training an **R-GCN (Relational Graph Convolutional Network)** model.
+This repository provides the full pipeline for constructing a unified clinical knowledge graph from **SNOMED CT** and **MIMIC-IV**, generating the required `graph.pt` file(which can be created from datacreation.py file), and training an **R-GCN (Relational Graph Convolutional Network)** model.
 
 The final model only requires **two files** to run:
 - `model_components.py`
