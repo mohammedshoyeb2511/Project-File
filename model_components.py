@@ -38,31 +38,40 @@ class DynamicEmbedder(nn.Module):
         nn.init.zeros_(self.proj_low.bias)
 
     def forward(self, node_ids):
-        DEVICE = node_ids.device
-        node_ids_cpu = node_ids.cpu()
+      DEVICE = node_ids.device
+      node_ids_cpu = node_ids.cpu()
+      out = torch.zeros(
+        node_ids.size(0),
+        self.emb_dim_common,
+        device=DEVICE,
+        dtype=torch.float32
+      )
+      high_mask = torch.isin(node_ids_cpu, self.high_nodes.cpu())
+      low_mask = ~high_mask
+      
+      if high_mask.any():
+        high_nodes = node_ids_cpu[high_mask]
+        high_idx = torch.tensor(
+            [self.id_map_high[int(i)] for i in high_nodes],
+            device=DEVICE
+        )
+        high_emb = self.proj_high(self.emb_high(high_idx))
 
-        out = torch.zeros(node_ids.size(0), self.emb_dim_common, device=DEVICE)
+        # ✅ FORCE dtype match before index_put
+        out[high_mask] = high_emb.to(out.dtype)
+      if low_mask.any():
+        low_nodes = node_ids_cpu[low_mask]
+        low_idx = torch.tensor(
+            [self.id_map_low.get(int(i), 0) for i in low_nodes],
+            device=DEVICE
+        )
 
-        high_mask = torch.isin(node_ids_cpu, self.high_nodes.cpu())
-        low_mask = ~high_mask
+        low_emb = self.proj_low(self.emb_low(low_idx))
 
-        if high_mask.any():
-            high_nodes = node_ids_cpu[high_mask]
-            high_idx = torch.tensor(
-                [self.id_map_high[int(i)] for i in high_nodes],
-                device=DEVICE
-            )
-            out[high_mask] = self.proj_high(self.emb_high(high_idx))
+        # ✅ FORCE dtype match before index_put
+        out[low_mask] = low_emb.to(out.dtype)
+      return out
 
-        if low_mask.any():
-            low_nodes = node_ids_cpu[low_mask]
-            low_idx = torch.tensor(
-                [self.id_map_low.get(int(i), 0) for i in low_nodes],
-                device=DEVICE
-            )
-            out[low_mask] = self.proj_low(self.emb_low(low_idx))
-
-        return out
 
 
 # ============================================================
@@ -87,10 +96,16 @@ class RGCNLayer(nn.Module):
         src = edge_index[0]
         dst = edge_index[1]
 
-        out = torch.zeros(num_nodes_local, self.W_0.out_features, device=DEVICE)
+        out = torch.zeros(
+            num_nodes_local,
+            self.W_0.out_features,
+            device=DEVICE,
+            dtype=x.dtype   # ✅ CRITICAL AMP FIX
+        )
 
-        deg = torch.zeros(num_nodes_local, device=DEVICE)
-        deg.index_add_(0, dst, torch.ones_like(dst, dtype=torch.float))
+
+        deg = torch.zeros(num_nodes_local, device=DEVICE, dtype=x.dtype)
+        deg.index_add_(0, dst, torch.ones_like(dst, dtype=x.dtype))
 
         for r in range(self.num_relations):
             mask = (edge_type == r)
@@ -206,63 +221,75 @@ def build_adj(num_nodes, edge_index, edge_type, num_relations):
 #                 Pure Python Neighbor Sampler (SAFE)
 # ============================================================
 def sample_subgraph(seeds, num_layers, num_neighbors,
-                    out_neighbors, num_relations, max_edges):
+                    node_adj, num_relations, max_edges):
 
+    # Convert seeds to Python ints
     frontier = set(int(s) for s in seeds.tolist())
     nodes = set(frontier)
 
+    # -----------------------
+    # LAYER-WISE EXPANSION
+    # -----------------------
     for _ in range(num_layers):
+
         new_frontier = set()
+
         for u in list(frontier):
 
-            for nbr_map in out_neighbors:
-                nbrs = nbr_map.get(u, [])
-                if not nbrs:
-                    continue
+            # If node has no neighbors
+            if u not in node_adj:
+                continue
 
-                chosen = nbrs if len(nbrs) <= num_neighbors else random.sample(nbrs, num_neighbors)
-                for v in chosen:
-                    if v not in nodes:
-                        nodes.add(v)
-                        new_frontier.add(v)
+            nbrs = node_adj[u]  # list of (relation, dst)
+
+            # Sample neighbors
+            if len(nbrs) <= num_neighbors:
+                chosen = nbrs
+            else:
+                chosen = random.sample(nbrs, num_neighbors)
+
+            for r, v in chosen:
+                if v not in nodes:
+                    nodes.add(v)
+                    new_frontier.add(v)
 
         frontier = new_frontier
+
+        # Hard cap to avoid huge subgraphs
         if len(nodes) * num_neighbors * num_layers > 2 * max_edges:
             break
 
+    # -----------------------
+    # BUILD LOCAL GRAPH
+    # -----------------------
     local_nodes = sorted(nodes)
     lut = {g: i for i, g in enumerate(local_nodes)}
 
     ls, ld, lr = [], [], []
     edge_count = 0
 
-    for r, nbr_map in enumerate(out_neighbors):
-        for u in local_nodes:
-            if u not in nbr_map:
-                continue
-            u_local = lut[u]
-            for v in nbr_map[u]:
-                if v in nodes:
-                    ls.append(u_local)
-                    ld.append(lut[v])
-                    lr.append(r)
-                    edge_count += 1
-                    if edge_count >= max_edges:
-                        break
+    for u in local_nodes:
+
+        if u not in node_adj:
+            continue
+
+        u_local = lut[u]
+
+        for r, v in node_adj[u]:
+            if v in nodes:
+                ls.append(u_local)
+                ld.append(lut[v])
+                lr.append(r)
+                edge_count += 1
+
+                if edge_count >= max_edges:
+                    break
 
     DEVICE = seeds.device
 
-    edge_index_local = (
-        torch.tensor([ls, ld], dtype=torch.long, device=DEVICE)
-        if ls else torch.empty(2,0,dtype=torch.long,device=DEVICE)
-    )
-
-    edge_type_local  = (
-        torch.tensor(lr, dtype=torch.long, device=DEVICE)
-        if lr else torch.empty(0,dtype=torch.long,device=DEVICE)
-    )
-
-    local_nodes = torch.tensor(local_nodes, dtype=torch.long, device=DEVICE)
+    edge_index_local = torch.tensor([ls, ld], dtype=torch.long, device=DEVICE)
+    edge_type_local  = torch.tensor(lr, dtype=torch.long, device=DEVICE)
+    local_nodes      = torch.tensor(local_nodes, dtype=torch.long, device=DEVICE)
 
     return local_nodes, edge_index_local, edge_type_local
 
