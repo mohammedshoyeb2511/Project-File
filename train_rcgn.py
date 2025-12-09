@@ -30,11 +30,11 @@ DROPOUT = 0.2
 
 NUM_NEIGHBORS = 4
 HIGH_DEG_PCT = 0.80
-MAX_EDGES = 150_000   # ✅ FIXED
+MAX_EDGES = 2_000_000   # ✅ FIXED
 
 LR = 1e-3
-EPOCHS = 4
-BATCH_SIZE = 768      # ✅ FIXED
+EPOCHS = 5
+BATCH_SIZE = 2048      # ✅ FIXED
 NEGATIVE_RATIO = 1
 
 # -------------------------------
